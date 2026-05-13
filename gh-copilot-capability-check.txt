@@ -1,0 +1,1 @@
+Can you accept image attachments or analyze a screenshot file path directly in this CLI session? Reply with exactly one JSON object like {"supportsImageInput":true|false,"notes":"..."} and nothing else.

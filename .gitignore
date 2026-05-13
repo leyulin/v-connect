@@ -1,0 +1,9 @@
+config.json
+adapter.json
+adapter-state.json
+wechat-login-result.json
+mock-sent-replies.jsonl
+logs/
+__pycache__/
+.venv/
+*.pyc

@@ -1,0 +1,15 @@
+[
+  {
+    "update_id": 1001,
+    "message": {
+      "message_id": 1,
+      "text": "Reply with exactly ADAPTER_OK",
+      "chat": {
+        "id": "wx-local-chat"
+      },
+      "from": {
+        "id": "local-user"
+      }
+    }
+  }
+]

@@ -1,0 +1,29 @@
+{
+  "bridge": {
+    "requestUri": "http://127.0.0.1:8765/message",
+    "sessionPrefix": "wechat"
+  },
+  "wechat": {
+    "baseUrl": "https://ilinkai.weixin.qq.com",
+    "botToken": "",
+    "loginResultPath": "wechat-login-result.json",
+    "routeTag": "",
+    "pollTimeoutSec": 20,
+    "pollIntervalMs": 1500,
+    "timeoutSec": 30,
+    "sendReplies": true,
+    "sendProcessingNotices": true,
+    "processingNoticeText": "收到，正在处理中。若涉及搜索或桌面操作，我处理完成后再把结果发给你。"
+  },
+  "mock": {
+    "enabled": true,
+    "updatesPath": "mock-updates.sample.json",
+    "sentRepliesPath": "mock-sent-replies.jsonl"
+  },
+  "storage": {
+    "statePath": "adapter-state.json"
+  },
+  "logging": {
+    "directory": "logs"
+  }
+}
