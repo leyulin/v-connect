@@ -17,6 +17,7 @@ exposes a local HTTP endpoint that a future adapter can call.
 - GUI-intent requests can be routed to a local GitHub CLI + OCR + pyautogui runner
 - A local test client script is included
 - The bridge persists recent session and media runtime state to a local JSON file
+- Incoming media now uses one unified `media[]` model across adapter and bridge
 
 ## Files
 
@@ -106,6 +107,7 @@ The adapter will:
 - send the bridge reply back with `sendMessage`
 - persist `lastUpdateId` in `adapter-state.json`
 - retain a bounded recent-media index for image follow-up commands such as Teams sends
+- attach a unified `media[]` payload for image / voice / file / video items
 
 ## HTTP Contract
 
@@ -143,6 +145,15 @@ and cached media survive a restart.
 
 `GET /health` now includes runtime-state counts so you can verify whether the
 bridge still has recent session/media context loaded.
+
+## Unified Media Model
+
+The bridge now treats inbound media as a single `media[]` shape instead of a
+separate image-only path.
+
+- `image` items can include a persisted local file path and continue to drive Teams image sends
+- `voice`, `file`, and `video` items currently flow as metadata-only entries with fields such as `kind`, `fileName`, and `text`
+- runtime state keeps the most recent media array per session/user so future routes can consume the same object model
 
 ## Notes
 

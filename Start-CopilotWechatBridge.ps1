@@ -258,8 +258,22 @@ function Invoke-BridgeRuntimeMaintenance {
 
     $RuntimeState.mediaEntries = @($RuntimeState.mediaEntries | Where-Object {
         $timestampUtc = ConvertTo-UtcDateTime -Value ([string](Get-OptionalPropertyValue -InputObject $_ -Name 'timestamp' -DefaultValue '')) -DefaultValue ([datetime]::MinValue)
-        $path = [string](Get-OptionalPropertyValue -InputObject $_ -Name 'path' -DefaultValue '')
-        $timestampUtc -ge $mediaCutoffUtc -and -not [string]::IsNullOrWhiteSpace($path) -and (Test-Path -LiteralPath $path)
+        $mediaItems = @((Get-OptionalPropertyValue -InputObject $_ -Name 'media' -DefaultValue @()))
+        $hasUsableMedia = $false
+        foreach ($mediaItem in $mediaItems) {
+            $path = [string](Get-OptionalPropertyValue -InputObject $mediaItem -Name 'path' -DefaultValue '')
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                $hasUsableMedia = $true
+                break
+            }
+
+            if (Test-Path -LiteralPath $path) {
+                $hasUsableMedia = $true
+                break
+            }
+        }
+
+        $timestampUtc -ge $mediaCutoffUtc -and $hasUsableMedia
     } | Sort-Object {
         ConvertTo-UtcDateTime -Value ([string](Get-OptionalPropertyValue -InputObject $_ -Name 'timestamp' -DefaultValue '')) -DefaultValue ([datetime]::MinValue)
     } -Descending | Select-Object -First $maxMediaEntries)
@@ -474,6 +488,34 @@ function Get-PayloadMediaItems {
     return @($Payload.media)
 }
 
+function Get-UsableImageMediaItems {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$MediaItems
+    )
+
+    $usableItems = @()
+    foreach ($item in $MediaItems) {
+        if ($null -eq $item) {
+            continue
+        }
+
+        $kind = [string](Get-OptionalPropertyValue -InputObject $item -Name 'kind' -DefaultValue '')
+        $path = [string](Get-OptionalPropertyValue -InputObject $item -Name 'path' -DefaultValue '')
+        if ($kind -ne 'image' -or [string]::IsNullOrWhiteSpace($path)) {
+            continue
+        }
+
+        if (-not (Test-Path -LiteralPath $path)) {
+            continue
+        }
+
+        $usableItems += $item
+    }
+
+    return @($usableItems)
+}
+
 function Get-LatestMediaCacheKey {
     param(
         [Parameter(Mandatory)]
@@ -642,18 +684,15 @@ function Get-TeamsMediaDeliveryRequest {
     }
 
     $mediaItems = @(Get-PayloadMediaItems -Payload $Payload)
-    if ($mediaItems.Count -eq 0) {
+    $usableImageItems = @(Get-UsableImageMediaItems -MediaItems $mediaItems)
+    if ($usableImageItems.Count -eq 0) {
         $mediaItems = @(Get-LatestMediaForPayload -Payload $Payload -RuntimeState $RuntimeState)
+        $usableImageItems = @(Get-UsableImageMediaItems -MediaItems $mediaItems)
     }
 
-    foreach ($item in $mediaItems) {
-        $kind = [string](Get-OptionalPropertyValue -InputObject $item -Name 'kind' -DefaultValue '')
+    foreach ($item in $usableImageItems) {
         $path = [string](Get-OptionalPropertyValue -InputObject $item -Name 'path' -DefaultValue '')
-        if ($kind -ne 'image' -or [string]::IsNullOrWhiteSpace($path)) {
-            continue
-        }
-
-        if (-not (Test-Path -LiteralPath $path)) {
+        if ([string]::IsNullOrWhiteSpace($path)) {
             continue
         }
 
@@ -1179,6 +1218,7 @@ function Invoke-BridgeMessage {
 
     $text = [string]$Payload.text
     $mediaItems = @(Get-PayloadMediaItems -Payload $Payload)
+    $usableImageMediaItems = @(Get-UsableImageMediaItems -MediaItems $mediaItems)
     if ([string]::IsNullOrWhiteSpace($text) -and $mediaItems.Count -eq 0) {
         throw 'Payload field text or media is required.'
     }
@@ -1207,7 +1247,7 @@ function Invoke-BridgeMessage {
         return $mediaDeliveryResult
     }
 
-    if ((Test-TeamsImageOnlySendRequest -Text $text) -and $mediaItems.Count -eq 0) {
+    if ((Test-TeamsImageOnlySendRequest -Text $text) -and $usableImageMediaItems.Count -eq 0) {
         $result = [PSCustomObject]@{
             ok = $false
             route = 'gui-media-missing'

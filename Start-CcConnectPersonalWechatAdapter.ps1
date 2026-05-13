@@ -192,9 +192,23 @@ function Invoke-AdapterStateMaintenance {
     $retentionCutoffUtc = [datetime]::UtcNow.AddHours(-1 * (Get-LatestMediaRetentionHours -Config $Config))
     $maxEntries = Get-LatestMediaMaxEntries -Config $Config
     $entries = @((Get-OptionalPropertyValue -InputObject $State -Name 'latestMediaEntries' -DefaultValue @()) | Where-Object {
-        $path = [string](Get-OptionalPropertyValue -InputObject $_ -Name 'path' -DefaultValue '')
         $timestampUtc = ConvertTo-UtcDateTime -Value ([string](Get-OptionalPropertyValue -InputObject $_ -Name 'timestamp' -DefaultValue '')) -DefaultValue ([datetime]::MinValue)
-        -not [string]::IsNullOrWhiteSpace($path) -and (Test-Path -LiteralPath $path) -and $timestampUtc -ge $retentionCutoffUtc
+        $mediaItems = @((Get-OptionalPropertyValue -InputObject $_ -Name 'media' -DefaultValue @()))
+        $hasUsableMedia = $false
+        foreach ($mediaItem in $mediaItems) {
+            $path = [string](Get-OptionalPropertyValue -InputObject $mediaItem -Name 'path' -DefaultValue '')
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                $hasUsableMedia = $true
+                break
+            }
+
+            if (Test-Path -LiteralPath $path) {
+                $hasUsableMedia = $true
+                break
+            }
+        }
+
+        $hasUsableMedia -and $timestampUtc -ge $retentionCutoffUtc
     } | Sort-Object {
         ConvertTo-UtcDateTime -Value ([string](Get-OptionalPropertyValue -InputObject $_ -Name 'timestamp' -DefaultValue '')) -DefaultValue ([datetime]::MinValue)
     } -Descending | Select-Object -First $maxEntries)
@@ -313,6 +327,171 @@ function Get-UpdateItemTypeNames {
     }
 
     return @($typeNames)
+}
+
+function Get-IlinkMediaKind {
+    param(
+        [int]$ItemType
+    )
+
+    switch ($ItemType) {
+        2 { return 'image' }
+        3 { return 'voice' }
+        4 { return 'file' }
+        5 { return 'video' }
+        default { return '' }
+    }
+}
+
+function Get-IlinkMediaFileName {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Item,
+        [Parameter(Mandatory)]
+        [string]$Kind
+    )
+
+    switch ($Kind) {
+        'file' {
+            $fileItem = Get-OptionalPropertyValue -InputObject $Item -Name 'file_item'
+            if ($null -ne $fileItem) {
+                $candidates = @(
+                    [string](Get-OptionalPropertyValue -InputObject $fileItem -Name 'file_name' -DefaultValue ''),
+                    [string](Get-OptionalPropertyValue -InputObject $fileItem -Name 'name' -DefaultValue '')
+                )
+                foreach ($candidate in $candidates) {
+                    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                        return $candidate.Trim()
+                    }
+                }
+            }
+        }
+        'video' {
+            $videoItem = Get-OptionalPropertyValue -InputObject $Item -Name 'video_item'
+            if ($null -ne $videoItem) {
+                $candidate = [string](Get-OptionalPropertyValue -InputObject $videoItem -Name 'file_name' -DefaultValue '')
+                if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                    return $candidate.Trim()
+                }
+            }
+        }
+    }
+
+    return ''
+}
+
+function Get-IlinkMediaTextPreview {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Item,
+        [Parameter(Mandatory)]
+        [string]$Kind
+    )
+
+    switch ($Kind) {
+        'voice' {
+            $voiceItem = Get-OptionalPropertyValue -InputObject $Item -Name 'voice_item'
+            if ($null -ne $voiceItem) {
+                return [string](Get-OptionalPropertyValue -InputObject $voiceItem -Name 'text' -DefaultValue '')
+            }
+        }
+        'file' {
+            $fileItem = Get-OptionalPropertyValue -InputObject $Item -Name 'file_item'
+            if ($null -ne $fileItem) {
+                return [string](Get-OptionalPropertyValue -InputObject $fileItem -Name 'caption' -DefaultValue '')
+            }
+        }
+        'video' {
+            $videoItem = Get-OptionalPropertyValue -InputObject $Item -Name 'video_item'
+            if ($null -ne $videoItem) {
+                return [string](Get-OptionalPropertyValue -InputObject $videoItem -Name 'caption' -DefaultValue '')
+            }
+        }
+    }
+
+    return ''
+}
+
+function New-BridgeMediaItem {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Kind,
+        [Parameter(Mandatory)]
+        [string]$Source,
+        [AllowEmptyString()]
+        [string]$Path = '',
+        [AllowEmptyString()]
+        [string]$MimeType = '',
+        [AllowEmptyString()]
+        [string]$FileName = '',
+        [AllowEmptyString()]
+        [string]$Text = '',
+        [int]$ByteCount = 0,
+        [int]$EncryptedByteCount = 0,
+        [AllowEmptyString()]
+        [string]$KeySource = '',
+        [AllowEmptyString()]
+        [string]$Availability = 'metadata-only'
+    )
+
+    return [PSCustomObject]@{
+        kind = $Kind
+        source = $Source
+        availability = $Availability
+        path = $Path
+        mimeType = $MimeType
+        fileName = $FileName
+        text = $Text
+        byteCount = $ByteCount
+        encryptedByteCount = $EncryptedByteCount
+        keySource = $KeySource
+    }
+}
+
+function Get-BridgeMediaItemsFromUpdate {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Update,
+        [AllowNull()]
+        [object]$SavedImage = $null
+    )
+
+    $mediaItems = @()
+    $imageAttached = $false
+    $itemList = @(Get-OptionalPropertyValue -InputObject $Update -Name 'item_list' -DefaultValue @())
+    foreach ($item in $itemList) {
+        if ($null -eq $item) {
+            continue
+        }
+
+        $itemType = [int](Get-OptionalPropertyValue -InputObject $item -Name 'type' -DefaultValue 0)
+        $kind = Get-IlinkMediaKind -ItemType $itemType
+        if ([string]::IsNullOrWhiteSpace($kind)) {
+            continue
+        }
+
+        if ($kind -eq 'image') {
+            if ($null -ne $SavedImage -and [bool](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'ok' -DefaultValue $false)) {
+                $mediaItems += (New-BridgeMediaItem -Kind 'image' -Source 'wechat' -Path ([string](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'path' -DefaultValue '')) -MimeType ([string](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'mimeType' -DefaultValue '')) -FileName ([System.IO.Path]::GetFileName([string](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'path' -DefaultValue ''))) -ByteCount ([int](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'byteCount' -DefaultValue 0)) -EncryptedByteCount ([int](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'encryptedByteCount' -DefaultValue 0)) -KeySource ([string](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'keySource' -DefaultValue '')) -Availability 'persisted')
+                $imageAttached = $true
+            }
+
+            continue
+        }
+
+        $textPreview = [string](Get-IlinkMediaTextPreview -Item $item -Kind $kind)
+        if (-not [string]::IsNullOrWhiteSpace($textPreview)) {
+            $textPreview = $textPreview.Trim()
+        }
+
+        $mediaItems += (New-BridgeMediaItem -Kind $kind -Source 'wechat' -FileName (Get-IlinkMediaFileName -Item $item -Kind $kind) -Text $textPreview -Availability 'metadata-only')
+    }
+
+    if (-not $imageAttached -and $null -ne $SavedImage -and [bool](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'ok' -DefaultValue $false)) {
+        $mediaItems += (New-BridgeMediaItem -Kind 'image' -Source 'wechat' -Path ([string](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'path' -DefaultValue '')) -MimeType ([string](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'mimeType' -DefaultValue '')) -FileName ([System.IO.Path]::GetFileName([string](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'path' -DefaultValue ''))) -ByteCount ([int](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'byteCount' -DefaultValue 0)) -EncryptedByteCount ([int](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'encryptedByteCount' -DefaultValue 0)) -KeySource ([string](Get-OptionalPropertyValue -InputObject $SavedImage -Name 'keySource' -DefaultValue '')) -Availability 'persisted')
+    }
+
+    return @($mediaItems)
 }
 
 function Get-UpdateDiagnosticSummary {
@@ -937,7 +1116,9 @@ function Convert-UpdateToBridgePayload {
         [Parameter(Mandatory)]
         [object]$Update,
         [Parameter(Mandatory)]
-        [object]$Config
+        [object]$Config,
+        [AllowNull()]
+        [object]$SavedImage = $null
     )
 
     $isMock = [bool](Get-OptionalPropertyValue -InputObject $Config.mock -Name 'enabled' -DefaultValue $false)
@@ -964,7 +1145,7 @@ function Convert-UpdateToBridgePayload {
         $mode = if ($text -match '(^|\s)/apply(\s|$)') { 'apply' } else { 'read' }
         $sessionPrefix = [string](Get-OptionalPropertyValue -InputObject $Config.bridge -Name 'sessionPrefix' -DefaultValue 'wechat')
 
-        return [PSCustomObject]@{
+        $payload = [PSCustomObject]@{
             updateId = [int](Get-OptionalPropertyValue -InputObject $Update -Name 'update_id' -DefaultValue 0)
             chatId = $chatId
             peerUserId = $chatId
@@ -974,6 +1155,13 @@ function Convert-UpdateToBridgePayload {
             mode = $mode
             contextToken = ''
         }
+
+        $mockMediaItems = @((Get-OptionalPropertyValue -InputObject $message -Name 'media' -DefaultValue @()))
+        if ($mockMediaItems.Count -gt 0) {
+            Set-OptionalPropertyValue -InputObject $payload -Name 'media' -Value $mockMediaItems
+        }
+
+        return $payload
     }
 
     $itemList = @(Get-OptionalPropertyValue -InputObject $Update -Name 'item_list' -DefaultValue @())
@@ -995,7 +1183,7 @@ function Convert-UpdateToBridgePayload {
     $clientId = [string](Get-OptionalPropertyValue -InputObject $Update -Name 'client_id' -DefaultValue '')
     $compoundUpdateId = [string]::Join('|', @($fromId, $messageId, $seq, $createTimeMs, $clientId))
 
-    return [PSCustomObject]@{
+    $payload = [PSCustomObject]@{
         updateId = $compoundUpdateId
         chatId = $fromId
         peerUserId = $fromId
@@ -1005,6 +1193,13 @@ function Convert-UpdateToBridgePayload {
         mode = $mode
         contextToken = [string](Get-OptionalPropertyValue -InputObject $Update -Name 'context_token' -DefaultValue '')
     }
+
+    $mediaItems = @(Get-BridgeMediaItemsFromUpdate -Update $Update -SavedImage $SavedImage)
+    if ($mediaItems.Count -gt 0) {
+        Set-OptionalPropertyValue -InputObject $payload -Name 'media' -Value $mediaItems
+    }
+
+    return $payload
 }
 
 function New-MediaOnlyBridgePayload {
@@ -1033,7 +1228,7 @@ function New-MediaOnlyBridgePayload {
     $clientId = [string](Get-OptionalPropertyValue -InputObject $Update -Name 'client_id' -DefaultValue '')
     $compoundUpdateId = [string]::Join('|', @($fromId, $messageId, $seq, $createTimeMs, $clientId))
 
-    return [PSCustomObject]@{
+    $payload = [PSCustomObject]@{
         updateId = $compoundUpdateId
         chatId = $fromId
         peerUserId = $fromId
@@ -1042,27 +1237,10 @@ function New-MediaOnlyBridgePayload {
         sessionId = ($sessionPrefix + '-' + $fromId)
         mode = 'read'
         contextToken = [string](Get-OptionalPropertyValue -InputObject $Update -Name 'context_token' -DefaultValue '')
-        media = @(New-BridgeImageMediaItem -Entry $SavedMedia -Source 'wechat')
     }
-}
 
-function New-BridgeImageMediaItem {
-    param(
-        [Parameter(Mandatory)]
-        [object]$Entry,
-        [Parameter(Mandatory)]
-        [string]$Source
-    )
-
-    return [PSCustomObject]@{
-        kind = 'image'
-        path = [string](Get-OptionalPropertyValue -InputObject $Entry -Name 'path' -DefaultValue '')
-        mimeType = [string](Get-OptionalPropertyValue -InputObject $Entry -Name 'mimeType' -DefaultValue '')
-        byteCount = [int](Get-OptionalPropertyValue -InputObject $Entry -Name 'byteCount' -DefaultValue 0)
-        encryptedByteCount = [int](Get-OptionalPropertyValue -InputObject $Entry -Name 'encryptedByteCount' -DefaultValue 0)
-        keySource = [string](Get-OptionalPropertyValue -InputObject $Entry -Name 'keySource' -DefaultValue '')
-        source = $Source
-    }
+    Set-OptionalPropertyValue -InputObject $payload -Name 'media' -Value @(Get-BridgeMediaItemsFromUpdate -Update $Update -SavedImage $SavedMedia)
+    return $payload
 }
 
 function Test-TeamsImageOnlySendIntent {
@@ -1092,15 +1270,10 @@ function Set-LatestSavedMediaEntry {
         [Parameter(Mandatory)]
         [object]$Payload,
         [Parameter(Mandatory)]
-        [object]$SavedMedia
+        [object[]]$MediaItems
     )
 
-    if (-not [bool](Get-OptionalPropertyValue -InputObject $SavedMedia -Name 'ok' -DefaultValue $false)) {
-        return
-    }
-
-    $path = [string](Get-OptionalPropertyValue -InputObject $SavedMedia -Name 'path' -DefaultValue '')
-    if ([string]::IsNullOrWhiteSpace($path)) {
+    if ($MediaItems.Count -eq 0) {
         return
     }
 
@@ -1129,11 +1302,7 @@ function Set-LatestSavedMediaEntry {
     $nextEntries.Add([PSCustomObject]@{
         userId = $userId
         sessionId = $sessionId
-        path = $path
-        mimeType = [string](Get-OptionalPropertyValue -InputObject $SavedMedia -Name 'mimeType' -DefaultValue '')
-        byteCount = [int](Get-OptionalPropertyValue -InputObject $SavedMedia -Name 'byteCount' -DefaultValue 0)
-        encryptedByteCount = [int](Get-OptionalPropertyValue -InputObject $SavedMedia -Name 'encryptedByteCount' -DefaultValue 0)
-        keySource = [string](Get-OptionalPropertyValue -InputObject $SavedMedia -Name 'keySource' -DefaultValue '')
+        media = @($MediaItems)
         timestamp = (Get-Date).ToString('o')
     })
 
@@ -1162,11 +1331,9 @@ function Get-LatestSavedMediaEntryFromDisk {
     return [PSCustomObject]@{
         userId = ''
         sessionId = ''
-        path = $candidate.FullName
-        mimeType = ''
-        byteCount = [int]$candidate.Length
-        encryptedByteCount = 0
-        keySource = 'disk-fallback'
+        media = @(
+            New-BridgeMediaItem -Kind 'image' -Source 'wechat-cache' -Path $candidate.FullName -FileName $candidate.Name -ByteCount ([int]$candidate.Length) -Availability 'persisted'
+        )
         timestamp = $candidate.LastWriteTimeUtc.ToString('o')
     }
 }
@@ -1229,12 +1396,12 @@ function Add-CachedMediaToPayloadIfNeeded {
         return $false
     }
 
-    $path = [string](Get-OptionalPropertyValue -InputObject $match -Name 'path' -DefaultValue '')
-    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) {
+    $mediaItems = @((Get-OptionalPropertyValue -InputObject $match -Name 'media' -DefaultValue @()))
+    if ($mediaItems.Count -eq 0) {
         return $false
     }
 
-    Set-OptionalPropertyValue -InputObject $Payload -Name 'media' -Value @(New-BridgeImageMediaItem -Entry $match -Source 'wechat-cache')
+    Set-OptionalPropertyValue -InputObject $Payload -Name 'media' -Value $mediaItems
 
     return $true
 }
@@ -1436,25 +1603,28 @@ function Invoke-UpdateProcessing {
         [object]$State
     )
 
-    $payload = Convert-UpdateToBridgePayload -Update $Update -Config $Config
+    $savedMedia = $null
+    if (-not [bool](Get-OptionalPropertyValue -InputObject $Config.mock -Name 'enabled' -DefaultValue $false)) {
+        try {
+            $savedMedia = Save-IlinkInboundImage -Config $Config -Update $Update
+        }
+        catch {
+            $savedMedia = [PSCustomObject]@{
+                ok = $false
+                reason = 'imagePersistenceError'
+                error = (Get-ExceptionSummary -ErrorRecord $_)
+            }
+        }
+    }
+
+    $payload = Convert-UpdateToBridgePayload -Update $Update -Config $Config -SavedImage $savedMedia
     if ($null -eq $payload) {
         if (-not [bool](Get-OptionalPropertyValue -InputObject $Config.mock -Name 'enabled' -DefaultValue $false)) {
-            $savedMedia = $null
             $bridgeResponse = $null
-            try {
-                $savedMedia = Save-IlinkInboundImage -Config $Config -Update $Update
-            }
-            catch {
-                $savedMedia = [PSCustomObject]@{
-                    ok = $false
-                    reason = 'imagePersistenceError'
-                    error = (Get-ExceptionSummary -ErrorRecord $_)
-                }
-            }
 
             $mediaPayload = New-MediaOnlyBridgePayload -Update $Update -Config $Config -SavedMedia $savedMedia
             if ($null -ne $mediaPayload) {
-                Set-LatestSavedMediaEntry -State $State -Payload $mediaPayload -SavedMedia $savedMedia
+                Set-LatestSavedMediaEntry -State $State -Payload $mediaPayload -MediaItems @((Get-OptionalPropertyValue -InputObject $mediaPayload -Name 'media' -DefaultValue @()))
                 $bridgeResponse = Invoke-BridgeMessage -Config $Config -Payload $mediaPayload
                 $reply = [string](Get-OptionalPropertyValue -InputObject $bridgeResponse -Name 'reply' -DefaultValue '')
                 if (
@@ -1477,6 +1647,11 @@ function Invoke-UpdateProcessing {
 
         $State.lastUpdateId = [Math]::Max([int]$State.lastUpdateId, [int](Get-OptionalPropertyValue -InputObject $Update -Name 'update_id' -DefaultValue 0))
         return
+    }
+
+    $payloadMedia = @((Get-OptionalPropertyValue -InputObject $payload -Name 'media' -DefaultValue @()))
+    if ($payloadMedia.Count -gt 0) {
+        Set-LatestSavedMediaEntry -State $State -Payload $payload -MediaItems $payloadMedia
     }
 
     $attachedCachedMedia = Add-CachedMediaToPayloadIfNeeded -Payload $payload -Config $Config -State $State
