@@ -30,8 +30,19 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:LatestMediaBySession = @{}
 $script:MissingTeamsImageReply = '还没有可发送的最近图片。请先在微信发一张图片，再发：打开我的teams 给某人发送'
+$script:DefaultRuntimeStateRelativePath = (Join-Path 'logs' 'bridge-runtime-state.json')
+$script:DefaultRuntimeSessionRetentionHours = 24
+$script:DefaultRuntimeMediaRetentionHours = 24
+$script:DefaultRuntimeMaxSessionEntries = 200
+$script:DefaultRuntimeMaxMediaEntries = 100
+
+function New-DefaultBridgeRuntimeState {
+    return [PSCustomObject]@{
+        sessions = @()
+        mediaEntries = @()
+    }
+}
 
 function Get-Utf8NoBomEncoding {
     return [System.Text.UTF8Encoding]::new($false)
@@ -78,6 +89,22 @@ function Get-BridgeConfig {
         throw "Configured repo.path does not exist: $($config.repo.path)"
     }
 
+    $logDirectory = [string](Get-OptionalPropertyValue -InputObject $config.logging -Name 'directory' -DefaultValue 'logs')
+    if (-not [System.IO.Path]::IsPathRooted($logDirectory)) {
+        $logDirectory = Resolve-NormalizedPath -Path (Join-Path $PSScriptRoot $logDirectory)
+    }
+    $config.logging.directory = $logDirectory
+
+    if ($config.PSObject.Properties.Match('storage').Count -eq 0 -or $null -eq $config.storage) {
+        $config | Add-Member -NotePropertyName storage -NotePropertyValue ([PSCustomObject]@{})
+    }
+
+    $runtimeStatePath = [string](Get-OptionalPropertyValue -InputObject $config.storage -Name 'runtimeStatePath' -DefaultValue (Join-Path $PSScriptRoot $script:DefaultRuntimeStateRelativePath))
+    if (-not [System.IO.Path]::IsPathRooted($runtimeStatePath)) {
+        $runtimeStatePath = Resolve-NormalizedPath -Path (Join-Path $PSScriptRoot $runtimeStatePath)
+    }
+    $config.storage.runtimeStatePath = $runtimeStatePath
+
     return $config
 }
 
@@ -108,6 +135,134 @@ function Get-OptionalPropertyValue {
     }
 
     return $InputObject.$Name
+}
+
+function Get-BridgeRetentionHours {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Config,
+        [Parameter(Mandatory)]
+        [string]$Name,
+        [ValidateRange(1, 8760)]
+        [int]$DefaultValue
+    )
+
+    $value = [int](Get-OptionalPropertyValue -InputObject $Config.storage -Name $Name -DefaultValue $DefaultValue)
+    if ($value -lt 1) {
+        return $DefaultValue
+    }
+
+    return $value
+}
+
+function Get-BridgeMaxEntryCount {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Config,
+        [Parameter(Mandatory)]
+        [string]$Name,
+        [ValidateRange(1, 100000)]
+        [int]$DefaultValue
+    )
+
+    $value = [int](Get-OptionalPropertyValue -InputObject $Config.storage -Name $Name -DefaultValue $DefaultValue)
+    if ($value -lt 1) {
+        return $DefaultValue
+    }
+
+    return $value
+}
+
+function ConvertTo-UtcDateTime {
+    param(
+        [AllowEmptyString()]
+        [string]$Value,
+        [Parameter(Mandatory)]
+        [datetime]$DefaultValue
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $DefaultValue
+    }
+
+    $parsed = [datetimeoffset]::MinValue
+    if ([datetimeoffset]::TryParse($Value, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) {
+        return $parsed.UtcDateTime
+    }
+
+    return $DefaultValue
+}
+
+function Get-BridgeRuntimeState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return New-DefaultBridgeRuntimeState
+    }
+
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8
+    $state = $raw | ConvertFrom-Json
+    if ($null -eq $state) {
+        return New-DefaultBridgeRuntimeState
+    }
+
+    if ($state.PSObject.Properties.Match('sessions').Count -eq 0) {
+        $state | Add-Member -NotePropertyName sessions -NotePropertyValue @()
+    }
+
+    if ($state.PSObject.Properties.Match('mediaEntries').Count -eq 0) {
+        $state | Add-Member -NotePropertyName mediaEntries -NotePropertyValue @()
+    }
+
+    return $state
+}
+
+function Save-BridgeRuntimeState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [object]$RuntimeState
+    )
+
+    $directoryPath = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($directoryPath) -and -not (Test-Path -LiteralPath $directoryPath)) {
+        New-Item -ItemType Directory -Path $directoryPath -Force | Out-Null
+    }
+
+    [System.IO.File]::WriteAllText($Path, (ConvertTo-BridgeJson -InputObject $RuntimeState), (Get-Utf8NoBomEncoding))
+}
+
+function Invoke-BridgeRuntimeMaintenance {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Config,
+        [Parameter(Mandatory)]
+        [object]$RuntimeState
+    )
+
+    $nowUtc = [datetime]::UtcNow
+    $sessionCutoffUtc = $nowUtc.AddHours(-1 * (Get-BridgeRetentionHours -Config $Config -Name 'sessionRetentionHours' -DefaultValue $script:DefaultRuntimeSessionRetentionHours))
+    $mediaCutoffUtc = $nowUtc.AddHours(-1 * (Get-BridgeRetentionHours -Config $Config -Name 'mediaRetentionHours' -DefaultValue $script:DefaultRuntimeMediaRetentionHours))
+    $maxSessionEntries = Get-BridgeMaxEntryCount -Config $Config -Name 'maxSessionEntries' -DefaultValue $script:DefaultRuntimeMaxSessionEntries
+    $maxMediaEntries = Get-BridgeMaxEntryCount -Config $Config -Name 'maxMediaEntries' -DefaultValue $script:DefaultRuntimeMaxMediaEntries
+
+    $RuntimeState.sessions = @($RuntimeState.sessions | Where-Object {
+        (ConvertTo-UtcDateTime -Value ([string](Get-OptionalPropertyValue -InputObject $_ -Name 'lastActivityAt' -DefaultValue '')) -DefaultValue ([datetime]::MinValue)) -ge $sessionCutoffUtc
+    } | Sort-Object {
+        ConvertTo-UtcDateTime -Value ([string](Get-OptionalPropertyValue -InputObject $_ -Name 'lastActivityAt' -DefaultValue '')) -DefaultValue ([datetime]::MinValue)
+    } -Descending | Select-Object -First $maxSessionEntries)
+
+    $RuntimeState.mediaEntries = @($RuntimeState.mediaEntries | Where-Object {
+        $timestampUtc = ConvertTo-UtcDateTime -Value ([string](Get-OptionalPropertyValue -InputObject $_ -Name 'timestamp' -DefaultValue '')) -DefaultValue ([datetime]::MinValue)
+        $path = [string](Get-OptionalPropertyValue -InputObject $_ -Name 'path' -DefaultValue '')
+        $timestampUtc -ge $mediaCutoffUtc -and -not [string]::IsNullOrWhiteSpace($path) -and (Test-Path -LiteralPath $path)
+    } | Sort-Object {
+        ConvertTo-UtcDateTime -Value ([string](Get-OptionalPropertyValue -InputObject $_ -Name 'timestamp' -DefaultValue '')) -DefaultValue ([datetime]::MinValue)
+    } -Descending | Select-Object -First $maxMediaEntries)
 }
 
 function Resolve-CommandPath {
@@ -343,7 +498,9 @@ function Set-LatestMediaForPayload {
         [Parameter(Mandatory)]
         [object]$Payload,
         [Parameter(Mandatory)]
-        [object[]]$MediaItems
+        [object[]]$MediaItems,
+        [Parameter(Mandatory)]
+        [object]$RuntimeState
     )
 
     if ($MediaItems.Count -eq 0) {
@@ -355,16 +512,33 @@ function Set-LatestMediaForPayload {
         return
     }
 
-    $script:LatestMediaBySession[$cacheKey] = [PSCustomObject]@{
+    $nextEntries = @()
+    foreach ($entry in @($RuntimeState.mediaEntries)) {
+        if ($null -eq $entry) {
+            continue
+        }
+
+        $entryCacheKey = [string](Get-OptionalPropertyValue -InputObject $entry -Name 'cacheKey' -DefaultValue '')
+        if ($entryCacheKey -eq $cacheKey) {
+            continue
+        }
+
+        $nextEntries += $entry
+    }
+
+    $RuntimeState.mediaEntries = @([PSCustomObject]@{
+        cacheKey = $cacheKey
         timestamp = (Get-Date).ToString('o')
         media = @($MediaItems)
-    }
+    }) + @($nextEntries)
 }
 
 function Get-LatestMediaForPayload {
     param(
         [Parameter(Mandatory)]
-        [object]$Payload
+        [object]$Payload,
+        [Parameter(Mandatory)]
+        [object]$RuntimeState
     )
 
     $cacheKey = Get-LatestMediaCacheKey -Payload $Payload
@@ -372,18 +546,89 @@ function Get-LatestMediaForPayload {
         return @()
     }
 
-    if (-not $script:LatestMediaBySession.ContainsKey($cacheKey)) {
-        return @()
+    foreach ($entry in @($RuntimeState.mediaEntries)) {
+        if ($null -eq $entry) {
+            continue
+        }
+
+        $entryCacheKey = [string](Get-OptionalPropertyValue -InputObject $entry -Name 'cacheKey' -DefaultValue '')
+        if ($entryCacheKey -ne $cacheKey) {
+            continue
+        }
+
+        return @((Get-OptionalPropertyValue -InputObject $entry -Name 'media' -DefaultValue @()))
     }
 
-    $entry = $script:LatestMediaBySession[$cacheKey]
-    return @((Get-OptionalPropertyValue -InputObject $entry -Name 'media' -DefaultValue @()))
+    return @()
+}
+
+function Set-BridgeSessionActivity {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Payload,
+        [Parameter(Mandatory)]
+        [object]$Result,
+        [Parameter(Mandatory)]
+        [object]$RuntimeState
+    )
+
+    $sessionId = [string](Get-OptionalPropertyValue -InputObject $Payload -Name 'sessionId' -DefaultValue '')
+    $userId = [string](Get-OptionalPropertyValue -InputObject $Payload -Name 'userId' -DefaultValue '')
+    if ([string]::IsNullOrWhiteSpace($sessionId) -and [string]::IsNullOrWhiteSpace($userId)) {
+        return
+    }
+
+    $sessionKey = if (-not [string]::IsNullOrWhiteSpace($sessionId)) {
+        'session:' + $sessionId.Trim()
+    }
+    else {
+        'user:' + $userId.Trim()
+    }
+
+    $nextSessions = @()
+    foreach ($entry in @($RuntimeState.sessions)) {
+        if ($null -eq $entry) {
+            continue
+        }
+
+        $entrySessionKey = [string](Get-OptionalPropertyValue -InputObject $entry -Name 'sessionKey' -DefaultValue '')
+        if ($entrySessionKey -eq $sessionKey) {
+            continue
+        }
+
+        $nextSessions += $entry
+    }
+
+    $text = [string](Get-OptionalPropertyValue -InputObject $Payload -Name 'text' -DefaultValue '')
+    $mediaItems = @(Get-PayloadMediaItems -Payload $Payload)
+    $lastTextPreview = ''
+    if (-not [string]::IsNullOrWhiteSpace($text)) {
+        if ($text.Length -le 120) {
+            $lastTextPreview = $text
+        }
+        else {
+            $lastTextPreview = $text.Substring(0, 120)
+        }
+    }
+
+    $RuntimeState.sessions = @([PSCustomObject]@{
+        sessionKey = $sessionKey
+        sessionId = $sessionId
+        userId = $userId
+        route = [string](Get-OptionalPropertyValue -InputObject $Result -Name 'route' -DefaultValue '')
+        mode = [string](Get-OptionalPropertyValue -InputObject $Result -Name 'mode' -DefaultValue '')
+        hasMedia = ($mediaItems.Count -gt 0)
+        lastTextPreview = $lastTextPreview
+        lastActivityAt = (Get-Date).ToString('o')
+    }) + @($nextSessions)
 }
 
 function Get-TeamsMediaDeliveryRequest {
     param(
         [Parameter(Mandatory)]
-        [object]$Payload
+        [object]$Payload,
+        [Parameter(Mandatory)]
+        [object]$RuntimeState
     )
 
     $text = [string](Get-OptionalPropertyValue -InputObject $Payload -Name 'text' -DefaultValue '')
@@ -398,7 +643,7 @@ function Get-TeamsMediaDeliveryRequest {
 
     $mediaItems = @(Get-PayloadMediaItems -Payload $Payload)
     if ($mediaItems.Count -eq 0) {
-        $mediaItems = @(Get-LatestMediaForPayload -Payload $Payload)
+        $mediaItems = @(Get-LatestMediaForPayload -Payload $Payload -RuntimeState $RuntimeState)
     }
 
     foreach ($item in $mediaItems) {
@@ -824,10 +1069,12 @@ function Invoke-TeamsMediaDelivery {
         [Parameter(Mandatory)]
         [object]$Config,
         [Parameter(Mandatory)]
-        [object]$Payload
+        [object]$Payload,
+        [Parameter(Mandatory)]
+        [object]$RuntimeState
     )
 
-    $request = Get-TeamsMediaDeliveryRequest -Payload $Payload
+    $request = Get-TeamsMediaDeliveryRequest -Payload $Payload -RuntimeState $RuntimeState
     if ($null -eq $request) {
         return $null
     }
@@ -911,12 +1158,11 @@ function Write-BridgeLog {
         return
     }
 
-    $resolvedDirectory = Resolve-NormalizedPath -Path (Join-Path $PSScriptRoot $logDirectory)
-    if (-not (Test-Path -LiteralPath $resolvedDirectory)) {
-        New-Item -ItemType Directory -Path $resolvedDirectory -Force | Out-Null
+    if (-not (Test-Path -LiteralPath $logDirectory)) {
+        New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     }
 
-    $logPath = Join-Path $resolvedDirectory 'bridge-log.jsonl'
+    $logPath = Join-Path $logDirectory 'bridge-log.jsonl'
     $line = (ConvertTo-BridgeJson -InputObject $Entry)
     [System.IO.File]::AppendAllText($logPath, $line + [Environment]::NewLine, (Get-Utf8NoBomEncoding))
 }
@@ -926,7 +1172,9 @@ function Invoke-BridgeMessage {
         [Parameter(Mandatory)]
         [object]$Config,
         [Parameter(Mandatory)]
-        [object]$Payload
+        [object]$Payload,
+        [Parameter(Mandatory)]
+        [object]$RuntimeState
     )
 
     $text = [string]$Payload.text
@@ -936,8 +1184,10 @@ function Invoke-BridgeMessage {
     }
 
     if ($mediaItems.Count -gt 0) {
-        Set-LatestMediaForPayload -Payload $Payload -MediaItems $mediaItems
+        Set-LatestMediaForPayload -Payload $Payload -MediaItems $mediaItems -RuntimeState $RuntimeState
     }
+
+    Invoke-BridgeRuntimeMaintenance -Config $Config -RuntimeState $RuntimeState
 
     $mode = Get-ExecutionMode -Payload $Payload
     $requestedRoute = if ($Payload.PSObject.Properties.Match('route').Count -gt 0) {
@@ -951,13 +1201,14 @@ function Invoke-BridgeMessage {
     $userId = [string]$Payload.userId
     $startedAt = Get-Date
 
-    $mediaDeliveryResult = Invoke-TeamsMediaDelivery -Config $Config -Payload $Payload
+    $mediaDeliveryResult = Invoke-TeamsMediaDelivery -Config $Config -Payload $Payload -RuntimeState $RuntimeState
     if ($null -ne $mediaDeliveryResult) {
+        Set-BridgeSessionActivity -Payload $Payload -Result $mediaDeliveryResult -RuntimeState $RuntimeState
         return $mediaDeliveryResult
     }
 
     if ((Test-TeamsImageOnlySendRequest -Text $text) -and $mediaItems.Count -eq 0) {
-        return [PSCustomObject]@{
+        $result = [PSCustomObject]@{
             ok = $false
             route = 'gui-media-missing'
             mode = $mode
@@ -967,10 +1218,12 @@ function Invoke-BridgeMessage {
             exitCode = 1
             durationMs = [int]((Get-Date) - $startedAt).TotalMilliseconds
         }
+        Set-BridgeSessionActivity -Payload $Payload -Result $result -RuntimeState $RuntimeState
+        return $result
     }
 
     if ([string]::IsNullOrWhiteSpace($text) -and $mediaItems.Count -gt 0) {
-        return [PSCustomObject]@{
+        $result = [PSCustomObject]@{
             ok = $true
             route = 'media-cache'
             mode = $mode
@@ -980,10 +1233,13 @@ function Invoke-BridgeMessage {
             exitCode = 0
             durationMs = [int]((Get-Date) - $startedAt).TotalMilliseconds
         }
+        Set-BridgeSessionActivity -Payload $Payload -Result $result -RuntimeState $RuntimeState
+        return $result
     }
 
     $deliveryResult = Invoke-GitHubTeamsDelivery -Config $Config -Payload $Payload
     if ($null -ne $deliveryResult) {
+        Set-BridgeSessionActivity -Payload $Payload -Result $deliveryResult -RuntimeState $RuntimeState
         return $deliveryResult
     }
 
@@ -991,7 +1247,7 @@ function Invoke-BridgeMessage {
         $guiResult = Invoke-GuiRunner -Config $Config -Prompt $text
         $durationMs = [int]((Get-Date) - $startedAt).TotalMilliseconds
 
-        return [PSCustomObject]@{
+        $result = [PSCustomObject]@{
             ok = ($guiResult.exitCode -eq 0)
             route = 'gui'
             mode = $mode
@@ -1003,13 +1259,15 @@ function Invoke-BridgeMessage {
             guiConfigured = [bool]$guiResult.configured
             timedOut = [bool](Get-OptionalPropertyValue -InputObject $guiResult -Name 'timedOut' -DefaultValue $false)
         }
+        Set-BridgeSessionActivity -Payload $Payload -Result $result -RuntimeState $RuntimeState
+        return $result
     }
 
     $prompt = New-CopilotPrompt -UserText $text -RepoPath ([string]$Config.repo.path) -Mode $mode -SessionId $sessionId
     $copilotResult = Invoke-CopilotRequest -Config $Config -Prompt $prompt -SessionName $sessionId
     $durationMs = [int]((Get-Date) - $startedAt).TotalMilliseconds
 
-    return [PSCustomObject]@{
+    $result = [PSCustomObject]@{
         ok = ($copilotResult.exitCode -eq 0)
         route = 'copilot'
         mode = $mode
@@ -1020,12 +1278,17 @@ function Invoke-BridgeMessage {
         durationMs = $durationMs
         repoPath = [string]$Config.repo.path
     }
+
+    Set-BridgeSessionActivity -Payload $Payload -Result $result -RuntimeState $RuntimeState
+    return $result
 }
 
 function Handle-BridgeRequest {
     param(
         [Parameter(Mandatory)]
         [object]$Config,
+        [Parameter(Mandatory)]
+        [object]$RuntimeState,
         [Parameter(Mandatory)]
         [System.Net.HttpListenerContext]$Context
     )
@@ -1034,6 +1297,8 @@ function Handle-BridgeRequest {
     $response = $Context.Response
 
     try {
+        Invoke-BridgeRuntimeMaintenance -Config $Config -RuntimeState $RuntimeState
+
         if ($request.HttpMethod -eq 'GET' -and $request.Url.AbsolutePath -eq '/health') {
             Write-JsonResponse -Response $response -StatusCode 200 -Body ([PSCustomObject]@{
                 ok = $true
@@ -1041,6 +1306,9 @@ function Handle-BridgeRequest {
                 repoPath = [string]$Config.repo.path
                 prefix = [string]$Config.server.prefix
                 copilotCommand = [string]$Config.copilot.command
+                runtimeStatePath = [string]$Config.storage.runtimeStatePath
+                sessionCount = @($RuntimeState.sessions).Count
+                mediaEntryCount = @($RuntimeState.mediaEntries).Count
                 guiConfigured = -not [string]::IsNullOrWhiteSpace([string](Get-OptionalPropertyValue -InputObject $Config.computerUse -Name 'command' -DefaultValue ''))
             })
             return
@@ -1065,7 +1333,8 @@ function Handle-BridgeRequest {
             return
         }
 
-        $result = Invoke-BridgeMessage -Config $Config -Payload $payload
+        $result = Invoke-BridgeMessage -Config $Config -Payload $payload -RuntimeState $RuntimeState
+        Save-BridgeRuntimeState -Path ([string]$Config.storage.runtimeStatePath) -RuntimeState $RuntimeState
         Write-BridgeLog -Config $Config -Entry ([PSCustomObject]@{
             timestamp = (Get-Date).ToString('o')
             request = $payload
@@ -1084,12 +1353,16 @@ function Handle-BridgeRequest {
 
 function Main {
     $config = Get-BridgeConfig -Path $ConfigPath
+    $runtimeState = Get-BridgeRuntimeState -Path ([string]$config.storage.runtimeStatePath)
+    Invoke-BridgeRuntimeMaintenance -Config $config -RuntimeState $runtimeState
+    Save-BridgeRuntimeState -Path ([string]$config.storage.runtimeStatePath) -RuntimeState $runtimeState
     $listener = [System.Net.HttpListener]::new()
     $listener.Prefixes.Add([string]$config.server.prefix)
     $listener.Start()
 
     Write-Host "Copilot WeChat bridge listening on $($config.server.prefix)"
     Write-Host "Repo path: $($config.repo.path)"
+    Write-Host "Runtime state: $($config.storage.runtimeStatePath)"
 
     $processedRequests = 0
 
@@ -1100,7 +1373,7 @@ function Main {
             }
 
             $context = $listener.GetContext()
-            Handle-BridgeRequest -Config $config -Context $context
+            Handle-BridgeRequest -Config $config -RuntimeState $runtimeState -Context $context
             $processedRequests++
         }
     }

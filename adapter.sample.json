@@ -21,7 +21,9 @@
     "sentRepliesPath": "mock-sent-replies.jsonl"
   },
   "storage": {
-    "statePath": "adapter-state.json"
+    "statePath": "adapter-state.json",
+    "latestMediaRetentionHours": 24,
+    "latestMediaMaxEntries": 50
   },
   "logging": {
     "directory": "logs"

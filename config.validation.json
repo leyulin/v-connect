@@ -29,6 +29,13 @@
       "o9cq807StDg3_203AqhMDNU-e2ds@im.wechat"
     ]
   },
+  "storage": {
+    "runtimeStatePath": "logs/bridge-runtime-state.json",
+    "sessionRetentionHours": 24,
+    "mediaRetentionHours": 24,
+    "maxSessionEntries": 200,
+    "maxMediaEntries": 100
+  },
   "logging": {
     "directory": "logs"
   }

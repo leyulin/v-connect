@@ -16,6 +16,7 @@ exposes a local HTTP endpoint that a future adapter can call.
   - `apply`: Copilot may edit repo files
 - GUI-intent requests can be routed to a local GitHub CLI + OCR + pyautogui runner
 - A local test client script is included
+- The bridge persists recent session and media runtime state to a local JSON file
 
 ## Files
 
@@ -26,6 +27,7 @@ exposes a local HTTP endpoint that a future adapter can call.
 - `config.sample.json` - sample configuration
 - `adapter.sample.json` - sample adapter configuration
 - `mock-updates.sample.json` - local mock update payload for adapter validation
+- `logs/bridge-runtime-state.json` - recent sessions and cached media metadata, created on first run
 
 ## Quick Start
 
@@ -103,6 +105,7 @@ The adapter will:
 - forward text messages to `/message`
 - send the bridge reply back with `sendMessage`
 - persist `lastUpdateId` in `adapter-state.json`
+- retain a bounded recent-media index for image follow-up commands such as Teams sends
 
 ## HTTP Contract
 
@@ -127,6 +130,19 @@ Optional fields:
 
 - `route: "gui"` to force the GUI fallback route
 - `mode: "apply"` to allow file changes
+
+## Runtime State
+
+The bridge now persists lightweight runtime state so that recent session activity
+and cached media survive a restart.
+
+- `storage.runtimeStatePath` controls where the bridge stores runtime state
+- `storage.sessionRetentionHours` and `storage.maxSessionEntries` bound recent session history
+- `storage.mediaRetentionHours` and `storage.maxMediaEntries` bound cached media metadata
+- `storage.latestMediaRetentionHours` and `storage.latestMediaMaxEntries` bound the adapter-side latest-media index
+
+`GET /health` now includes runtime-state counts so you can verify whether the
+bridge still has recent session/media context loaded.
 
 ## Notes
 

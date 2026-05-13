@@ -40,6 +40,8 @@ $script:DefaultIlinkPostTimeoutSec = 30
 $script:DefaultPollTimeoutSec = 20
 $script:PollTimeoutBufferSec = 5
 $script:InboundImageDownloadTimeoutSec = 90
+$script:DefaultLatestMediaRetentionHours = 24
+$script:DefaultLatestMediaMaxEntries = 50
 
 function New-DefaultAdapterState {
     return [PSCustomObject]@{
@@ -129,6 +131,75 @@ function Get-OptionalPropertyValue {
     }
 
     return $DefaultValue
+}
+
+function ConvertTo-UtcDateTime {
+    param(
+        [AllowEmptyString()]
+        [string]$Value,
+        [Parameter(Mandatory)]
+        [datetime]$DefaultValue
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $DefaultValue
+    }
+
+    $parsed = [datetimeoffset]::MinValue
+    if ([datetimeoffset]::TryParse($Value, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) {
+        return $parsed.UtcDateTime
+    }
+
+    return $DefaultValue
+}
+
+function Get-LatestMediaRetentionHours {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Config
+    )
+
+    $hours = [int](Get-OptionalPropertyValue -InputObject $Config.storage -Name 'latestMediaRetentionHours' -DefaultValue $script:DefaultLatestMediaRetentionHours)
+    if ($hours -lt 1) {
+        return $script:DefaultLatestMediaRetentionHours
+    }
+
+    return $hours
+}
+
+function Get-LatestMediaMaxEntries {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Config
+    )
+
+    $count = [int](Get-OptionalPropertyValue -InputObject $Config.storage -Name 'latestMediaMaxEntries' -DefaultValue $script:DefaultLatestMediaMaxEntries)
+    if ($count -lt 1) {
+        return $script:DefaultLatestMediaMaxEntries
+    }
+
+    return $count
+}
+
+function Invoke-AdapterStateMaintenance {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Config,
+        [Parameter(Mandatory)]
+        [object]$State
+    )
+
+    $retentionCutoffUtc = [datetime]::UtcNow.AddHours(-1 * (Get-LatestMediaRetentionHours -Config $Config))
+    $maxEntries = Get-LatestMediaMaxEntries -Config $Config
+    $entries = @((Get-OptionalPropertyValue -InputObject $State -Name 'latestMediaEntries' -DefaultValue @()) | Where-Object {
+        $path = [string](Get-OptionalPropertyValue -InputObject $_ -Name 'path' -DefaultValue '')
+        $timestampUtc = ConvertTo-UtcDateTime -Value ([string](Get-OptionalPropertyValue -InputObject $_ -Name 'timestamp' -DefaultValue '')) -DefaultValue ([datetime]::MinValue)
+        -not [string]::IsNullOrWhiteSpace($path) -and (Test-Path -LiteralPath $path) -and $timestampUtc -ge $retentionCutoffUtc
+    } | Sort-Object {
+        ConvertTo-UtcDateTime -Value ([string](Get-OptionalPropertyValue -InputObject $_ -Name 'timestamp' -DefaultValue '')) -DefaultValue ([datetime]::MinValue)
+    } -Descending | Select-Object -First $maxEntries)
+
+    $State.latestMediaEntries = $entries
 }
 
 function New-RandomHex {
@@ -1440,6 +1511,7 @@ function Invoke-UpdateProcessing {
 function Main {
     $config = Get-AdapterConfig -Path $ConfigPath
     $state = Get-AdapterState -Path ([string]$config.storage.statePath)
+    Invoke-AdapterStateMaintenance -Config $config -State $state
     if (Sync-AdapterStateWithConfig -Config $config -State $state) {
         Save-AdapterState -Path ([string]$config.storage.statePath) -State $state
     }
@@ -1483,10 +1555,12 @@ function Main {
 
             foreach ($update in $updates) {
                 Invoke-UpdateProcessing -Config $config -Update $update -State $state
+                Invoke-AdapterStateMaintenance -Config $config -State $state
                 Save-AdapterState -Path ([string]$config.storage.statePath) -State $state
             }
 
             if ($updates.Count -eq 0) {
+                Invoke-AdapterStateMaintenance -Config $config -State $state
                 Save-AdapterState -Path ([string]$config.storage.statePath) -State $state
             }
 
